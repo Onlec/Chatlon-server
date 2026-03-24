@@ -55,10 +55,57 @@ function createApp({
   app.get('/browser/frame/:sessionId', async (req, res, next) => {
     try {
       const frame = await browserService.getFrame(req.params.sessionId);
-      res.setHeader('Content-Type', 'image/png');
+      if (!frame?.buffer) {
+        res.status(503).json({
+          error: 'Browserframe nog niet beschikbaar.'
+        });
+        return;
+      }
+      res.setHeader('Content-Type', frame.mimeType || 'image/jpeg');
       res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.send(frame);
+      res.send(frame.buffer);
     } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/browser/events/:sessionId', (req, res, next) => {
+    let subscription = null;
+    let heartbeatTimer = null;
+
+    try {
+      subscription = browserService.subscribeState(req.params.sessionId, (state) => {
+        res.write(`event: state\ndata: ${JSON.stringify(state)}\n\n`);
+      });
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-store, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      res.write(`event: state\ndata: ${JSON.stringify(subscription.state)}\n\n`);
+
+      heartbeatTimer = setInterval(() => {
+        res.write(': ping\n\n');
+      }, 15000);
+
+      req.on('close', () => {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+        subscription?.unsubscribe();
+      });
+    } catch (error) {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+      subscription?.unsubscribe?.();
       next(error);
     }
   });

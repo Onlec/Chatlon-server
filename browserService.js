@@ -3,6 +3,16 @@ const { randomUUID } = require('crypto');
 const BROWSER_HOME_URL = 'yoctol://home';
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+const DEFAULT_FRAME_MIME_TYPE = 'image/jpeg';
+const MAX_VIEWPORT_AREA = 640000;
+const DIRTY_INPUT_TYPES = new Set([
+  'resize',
+  'click',
+  'dblclick',
+  'wheel',
+  'keydown',
+  'type'
+]);
 
 function createHomeEntry() {
   return {
@@ -20,6 +30,22 @@ function createPageEntry(url, title) {
   };
 }
 
+function normalizeViewportSize(rawWidth, rawHeight) {
+  const width = Math.max(1, Math.floor(Number(rawWidth) || DEFAULT_VIEWPORT.width));
+  const height = Math.max(1, Math.floor(Number(rawHeight) || DEFAULT_VIEWPORT.height));
+  const area = width * height;
+
+  if (area <= MAX_VIEWPORT_AREA) {
+    return { width, height };
+  }
+
+  const scale = Math.sqrt(MAX_VIEWPORT_AREA / area);
+  return {
+    width: Math.max(1, Math.floor(width * scale)),
+    height: Math.max(1, Math.floor(height * scale))
+  };
+}
+
 function cloneState(session) {
   const currentEntry = session.history[session.historyIndex] || createHomeEntry();
   return {
@@ -31,7 +57,10 @@ function cloneState(session) {
     isLoading: Boolean(session.isLoading),
     lastError: session.lastError,
     viewportWidth: session.viewportWidth,
-    viewportHeight: session.viewportHeight
+    viewportHeight: session.viewportHeight,
+    frameVersion: session.frameVersion,
+    frameMimeType: session.frameMimeType,
+    hasFreshFrame: session.hasFreshFrame
   };
 }
 
@@ -59,6 +88,20 @@ function createBrowserService({
     session.lastTouchedAt = now();
   };
 
+  const publishState = (session) => {
+    const snapshot = cloneState(session);
+    for (const listener of session.listeners) {
+      try {
+        listener(snapshot);
+      } catch {}
+    }
+    return snapshot;
+  };
+
+  const markFrameStale = (session) => {
+    session.hasFreshFrame = false;
+  };
+
   const updateCurrentEntry = (session, payload) => {
     const entry = payload.mode === 'home'
       ? createHomeEntry()
@@ -84,6 +127,14 @@ function createBrowserService({
     session.navigationPhase = null;
   };
 
+  const handleFrame = (session, frame) => {
+    touch(session);
+    session.frameVersion += 1;
+    session.frameMimeType = frame.mimeType || DEFAULT_FRAME_MIME_TYPE;
+    session.hasFreshFrame = true;
+    publishState(session);
+  };
+
   const handleNavigation = (session, payload) => {
     touch(session);
     session.lastError = null;
@@ -100,6 +151,7 @@ function createBrowserService({
         : createPageEntry(payload.url, payload.title)
     );
     session.navigationPhase = 'replace-current';
+    publishState(session);
   };
 
   const handleError = (session, error) => {
@@ -107,17 +159,28 @@ function createBrowserService({
     session.isLoading = false;
     session.lastError = typeof error === 'string' ? error : (error?.message || 'Onbekende browserfout.');
     clearNavigationPhase(session);
+    publishState(session);
   };
 
   const handleLoadingChange = (session, isLoading) => {
     touch(session);
     session.isLoading = Boolean(isLoading);
-    if (!isLoading) {
-      clearNavigationPhase(session);
+    if (isLoading) {
+      markFrameStale(session);
+      publishState(session);
+      return;
     }
+    clearNavigationPhase(session);
+    publishState(session);
   };
 
-  const createManagedSession = async ({ userKey, sessionScope, viewportWidth, viewportHeight }) => {
+  const createManagedSession = async ({
+    userKey,
+    sessionScope,
+    viewportWidth,
+    viewportHeight
+  }) => {
+    const normalizedViewport = normalizeViewportSize(viewportWidth, viewportHeight);
     const homeEntry = createHomeEntry();
     const session = {
       id: randomUUID(),
@@ -128,25 +191,32 @@ function createBrowserService({
       historyIndex: 0,
       isLoading: true,
       lastError: null,
-      viewportWidth,
-      viewportHeight,
+      viewportWidth: normalizedViewport.width,
+      viewportHeight: normalizedViewport.height,
       navigationPhase: 'replace-current',
       lastTouchedAt: now(),
+      frameVersion: 0,
+      frameMimeType: DEFAULT_FRAME_MIME_TYPE,
+      hasFreshFrame: false,
+      listeners: new Set(),
       remote: null
     };
 
     session.remote = await engine.createSession({
       sessionId: session.id,
-      viewportWidth,
-      viewportHeight,
+      viewportWidth: normalizedViewport.width,
+      viewportHeight: normalizedViewport.height,
       onNavigation: (payload) => handleNavigation(session, payload),
       onLoadingChange: (isLoading) => handleLoadingChange(session, isLoading),
-      onError: (error) => handleError(session, error)
+      onError: (error) => handleError(session, error),
+      onFrame: (frame) => handleFrame(session, frame)
     });
 
     await session.remote.navigateHome();
+    await session.remote.ensureFrame();
     session.isLoading = false;
     clearNavigationPhase(session);
+    publishState(session);
 
     sessionsById.set(session.id, session);
     sessionIdByKey.set(session.key, session.id);
@@ -160,6 +230,7 @@ function createBrowserService({
     viewportWidth = DEFAULT_VIEWPORT.width,
     viewportHeight = DEFAULT_VIEWPORT.height
   } = {}) => {
+    const normalizedViewport = normalizeViewportSize(viewportWidth, viewportHeight);
     const key = `${userKey}::${sessionScope}`;
     const existingId = sessionIdByKey.get(key);
     const existing = existingId ? sessionsById.get(existingId) : null;
@@ -167,15 +238,17 @@ function createBrowserService({
     if (existing) {
       touch(existing);
       if (
-        existing.viewportWidth !== viewportWidth
-        || existing.viewportHeight !== viewportHeight
+        existing.viewportWidth !== normalizedViewport.width
+        || existing.viewportHeight !== normalizedViewport.height
       ) {
-        existing.viewportWidth = viewportWidth;
-        existing.viewportHeight = viewportHeight;
+        existing.viewportWidth = normalizedViewport.width;
+        existing.viewportHeight = normalizedViewport.height;
+        markFrameStale(existing);
+        publishState(existing);
         await existing.remote.handleInput({
           type: 'resize',
-          viewportWidth,
-          viewportHeight
+          viewportWidth: normalizedViewport.width,
+          viewportHeight: normalizedViewport.height
         });
       }
       return cloneState(existing);
@@ -184,8 +257,8 @@ function createBrowserService({
     const session = await createManagedSession({
       userKey,
       sessionScope,
-      viewportWidth,
-      viewportHeight
+      viewportWidth: normalizedViewport.width,
+      viewportHeight: normalizedViewport.height
     });
 
     return cloneState(session);
@@ -209,7 +282,9 @@ function createBrowserService({
     session.lastError = null;
     session.isLoading = true;
     session.navigationPhase = 'replace-current';
+    markFrameStale(session);
     pushEntry(session, createPageEntry(url, url));
+    publishState(session);
 
     try {
       await session.remote.navigate(url);
@@ -226,7 +301,9 @@ function createBrowserService({
     session.lastError = null;
     session.isLoading = true;
     session.navigationPhase = 'replace-current';
+    markFrameStale(session);
     pushEntry(session, createHomeEntry());
+    publishState(session);
 
     try {
       await session.remote.navigateHome();
@@ -248,6 +325,8 @@ function createBrowserService({
     session.isLoading = true;
     session.historyIndex -= 1;
     session.navigationPhase = 'replace-current';
+    markFrameStale(session);
+    publishState(session);
 
     try {
       await session.remote.goBack();
@@ -269,6 +348,8 @@ function createBrowserService({
     session.isLoading = true;
     session.historyIndex += 1;
     session.navigationPhase = 'replace-current';
+    markFrameStale(session);
+    publishState(session);
 
     try {
       await session.remote.goForward();
@@ -285,6 +366,8 @@ function createBrowserService({
     session.lastError = null;
     session.isLoading = true;
     session.navigationPhase = 'replace-current';
+    markFrameStale(session);
+    publishState(session);
 
     try {
       await session.remote.reload();
@@ -301,20 +384,48 @@ function createBrowserService({
     session.isLoading = false;
     clearNavigationPhase(session);
     await session.remote.stop();
-    return cloneState(session);
+    return publishState(session);
   };
 
   const handleInput = async (sessionId, payload = {}) => {
     const session = getSession(sessionId);
     touch(session);
 
+    let nextPayload = payload;
+
     if (payload.type === 'resize') {
-      session.viewportWidth = payload.viewportWidth || session.viewportWidth;
-      session.viewportHeight = payload.viewportHeight || session.viewportHeight;
+      const normalizedViewport = normalizeViewportSize(
+        payload.viewportWidth || session.viewportWidth,
+        payload.viewportHeight || session.viewportHeight
+      );
+      session.viewportWidth = normalizedViewport.width;
+      session.viewportHeight = normalizedViewport.height;
+      nextPayload = {
+        ...payload,
+        viewportWidth: normalizedViewport.width,
+        viewportHeight: normalizedViewport.height
+      };
     }
 
-    await session.remote.handleInput(payload);
+    if (DIRTY_INPUT_TYPES.has(nextPayload.type)) {
+      markFrameStale(session);
+    }
+
+    publishState(session);
+    await session.remote.handleInput(nextPayload);
     return cloneState(session);
+  };
+
+  const subscribeState = (sessionId, listener) => {
+    const session = getSession(sessionId);
+    touch(session);
+    session.listeners.add(listener);
+    return {
+      state: cloneState(session),
+      unsubscribe: () => {
+        session.listeners.delete(listener);
+      }
+    };
   };
 
   const destroySession = async (sessionId) => {
@@ -323,6 +434,7 @@ function createBrowserService({
 
     sessionsById.delete(sessionId);
     sessionIdByKey.delete(session.key);
+    session.listeners.clear();
     await session.remote.dispose();
   };
 
@@ -373,6 +485,7 @@ function createBrowserService({
     reload,
     stop,
     handleInput,
+    subscribeState,
     destroySession,
     disposeIdleSessions,
     dispose
@@ -382,5 +495,7 @@ function createBrowserService({
 module.exports = {
   BROWSER_HOME_URL,
   DEFAULT_IDLE_TIMEOUT_MS,
+  MAX_VIEWPORT_AREA,
+  normalizeViewportSize,
   createBrowserService
 };

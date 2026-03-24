@@ -1,5 +1,11 @@
 const { BROWSER_HOME_URL } = require('./browserService');
 
+const INTERACTIVE_RENDER_DELAY_MS = 35;
+const IDLE_RENDER_DELAY_MS = 180;
+const INTERACTIVE_JPEG_QUALITY = 46;
+const IDLE_JPEG_QUALITY = 78;
+const FRAME_MIME_TYPE = 'image/jpeg';
+
 function createMissingPlaywrightError(error) {
   const message = error?.message || 'Playwright is niet beschikbaar.';
   return new Error(
@@ -57,7 +63,8 @@ function createPlaywrightBrowserEngine({
     viewportHeight,
     onNavigation,
     onLoadingChange,
-    onError
+    onError,
+    onFrame
   }) => {
     const browser = await getBrowser();
     const context = await browser.newContext({
@@ -69,6 +76,12 @@ function createPlaywrightBrowserEngine({
     });
     const page = await context.newPage();
     let homeVisitId = 0;
+    let interactiveRenderTimer = null;
+    let idleRenderTimer = null;
+    let cachedFrame = null;
+    let renderInFlight = null;
+    let pendingRenderQuality = null;
+    let disposed = false;
 
     const isHomeTarget = (url) => typeof url === 'string' && url.includes('#yoctol-home=');
 
@@ -83,6 +96,86 @@ function createPlaywrightBrowserEngine({
       });
     };
 
+    const clearRenderTimers = () => {
+      if (interactiveRenderTimer) {
+        clearTimeout(interactiveRenderTimer);
+        interactiveRenderTimer = null;
+      }
+      if (idleRenderTimer) {
+        clearTimeout(idleRenderTimer);
+        idleRenderTimer = null;
+      }
+    };
+
+    const renderFrame = async (quality) => {
+      if (disposed) return cachedFrame;
+
+      const buffer = await page.screenshot({
+        type: 'jpeg',
+        quality,
+        animations: 'disabled',
+        caret: 'hide'
+      });
+
+      cachedFrame = {
+        buffer,
+        mimeType: FRAME_MIME_TYPE
+      };
+      onFrame?.(cachedFrame);
+      return cachedFrame;
+    };
+
+    const processRenderQueue = () => {
+      if (disposed || renderInFlight || pendingRenderQuality === null) {
+        return renderInFlight;
+      }
+
+      const quality = pendingRenderQuality;
+      pendingRenderQuality = null;
+
+      renderInFlight = renderFrame(quality)
+        .catch((error) => {
+          onError?.(error);
+          return cachedFrame;
+        })
+        .finally(() => {
+          renderInFlight = null;
+          if (pendingRenderQuality !== null) {
+            processRenderQueue();
+          }
+        });
+
+      return renderInFlight;
+    };
+
+    const queueRender = (quality) => {
+      if (disposed) return renderInFlight;
+      pendingRenderQuality = Math.max(pendingRenderQuality || 0, quality);
+      return processRenderQueue();
+    };
+
+    const scheduleInteractiveRender = () => {
+      if (disposed) return;
+      if (interactiveRenderTimer) {
+        clearTimeout(interactiveRenderTimer);
+      }
+      interactiveRenderTimer = setTimeout(() => {
+        interactiveRenderTimer = null;
+        queueRender(INTERACTIVE_JPEG_QUALITY);
+      }, INTERACTIVE_RENDER_DELAY_MS);
+    };
+
+    const scheduleIdleRender = () => {
+      if (disposed) return;
+      if (idleRenderTimer) {
+        clearTimeout(idleRenderTimer);
+      }
+      idleRenderTimer = setTimeout(() => {
+        idleRenderTimer = null;
+        queueRender(IDLE_JPEG_QUALITY);
+      }, IDLE_RENDER_DELAY_MS);
+    };
+
     page.on('framenavigated', async (frame) => {
       if (frame !== page.mainFrame()) return;
       try {
@@ -92,8 +185,14 @@ function createPlaywrightBrowserEngine({
       }
     });
 
+    page.on('domcontentloaded', () => {
+      scheduleInteractiveRender();
+      scheduleIdleRender();
+    });
+
     page.on('load', () => {
       onLoadingChange?.(false);
+      scheduleIdleRender();
     });
 
     page.on('pageerror', (error) => {
@@ -102,6 +201,7 @@ function createPlaywrightBrowserEngine({
 
     page.on('requestfailed', (request) => {
       if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+        onLoadingChange?.(false);
         onError?.(request.failure()?.errorText || 'Navigatieverzoek mislukt.');
       }
     });
@@ -113,27 +213,34 @@ function createPlaywrightBrowserEngine({
     const navigateHome = async () => {
       onLoadingChange?.(true);
       await page.goto(encodeHomeDocument(sessionId, ++homeVisitId), {
-        waitUntil: 'load'
+        waitUntil: 'domcontentloaded'
       });
+      scheduleInteractiveRender();
+      scheduleIdleRender();
     };
 
     const navigate = async (url) => {
       onLoadingChange?.(true);
       await page.goto(url, {
-        waitUntil: 'load'
+        waitUntil: 'domcontentloaded'
       });
+      scheduleInteractiveRender();
+      scheduleIdleRender();
     };
 
     const stepHistory = async (direction) => {
       onLoadingChange?.(true);
       const result = direction === 'back'
-        ? await page.goBack({ waitUntil: 'load' })
-        : await page.goForward({ waitUntil: 'load' });
+        ? await page.goBack({ waitUntil: 'domcontentloaded' })
+        : await page.goForward({ waitUntil: 'domcontentloaded' });
 
       if (!result) {
         onLoadingChange?.(false);
         await emitNavigation();
       }
+
+      scheduleInteractiveRender();
+      scheduleIdleRender();
     };
 
     return {
@@ -143,11 +250,14 @@ function createPlaywrightBrowserEngine({
       goForward: async () => stepHistory('forward'),
       reload: async () => {
         onLoadingChange?.(true);
-        await page.reload({ waitUntil: 'load' });
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        scheduleInteractiveRender();
+        scheduleIdleRender();
       },
       stop: async () => {
         await page.evaluate(() => window.stop()).catch(() => {});
         onLoadingChange?.(false);
+        scheduleIdleRender();
       },
       handleInput: async (payload = {}) => {
         switch (payload.type) {
@@ -157,6 +267,8 @@ function createPlaywrightBrowserEngine({
                 width: payload.viewportWidth,
                 height: payload.viewportHeight
               });
+              scheduleInteractiveRender();
+              scheduleIdleRender();
             }
             return;
           case 'move':
@@ -167,24 +279,34 @@ function createPlaywrightBrowserEngine({
               button: payload.button || 'left',
               clickCount: 1
             });
+            scheduleInteractiveRender();
+            scheduleIdleRender();
             return;
           case 'dblclick':
             await page.mouse.click(payload.x || 0, payload.y || 0, {
               button: payload.button || 'left',
               clickCount: 2
             });
+            scheduleInteractiveRender();
+            scheduleIdleRender();
             return;
           case 'wheel':
             await page.mouse.wheel(payload.deltaX || 0, payload.deltaY || 0);
+            scheduleInteractiveRender();
+            scheduleIdleRender();
             return;
           case 'keydown':
             await page.keyboard.press(payload.key);
+            scheduleInteractiveRender();
+            scheduleIdleRender();
             return;
           case 'keyup':
             await page.keyboard.up(payload.key);
             return;
           case 'type':
-            await page.keyboard.type(payload.text || '');
+            await page.keyboard.insertText(payload.text || '');
+            scheduleInteractiveRender();
+            scheduleIdleRender();
             return;
           case 'focus':
             await page.bringToFront().catch(() => {});
@@ -193,10 +315,21 @@ function createPlaywrightBrowserEngine({
             return;
         }
       },
-      getFrame: async () => page.screenshot({
-        type: 'png'
-      }),
+      ensureFrame: async () => {
+        clearRenderTimers();
+        if (!cachedFrame && !renderInFlight) {
+          return renderFrame(IDLE_JPEG_QUALITY);
+        }
+        if (renderInFlight) {
+          await renderInFlight;
+        }
+        return cachedFrame;
+      },
+      getFrame: async () => cachedFrame,
       dispose: async () => {
+        disposed = true;
+        clearRenderTimers();
+        pendingRenderQuality = null;
         await context.close();
       }
     };
