@@ -11,7 +11,8 @@ const DIRTY_INPUT_TYPES = new Set([
   'dblclick',
   'wheel',
   'keydown',
-  'type'
+  'type',
+  'paste'
 ]);
 
 function createHomeEntry() {
@@ -83,6 +84,7 @@ function createBrowserService({
 
   const sessionsById = new Map();
   const sessionIdByKey = new Map();
+  const pendingSessionPromisesByKey = new Map();
 
   const touch = (session) => {
     session.lastTouchedAt = now();
@@ -96,6 +98,20 @@ function createBrowserService({
       } catch {}
     }
     return snapshot;
+  };
+
+  const publishFrame = (session) => {
+    if (!session.lastFrame) {
+      return null;
+    }
+
+    for (const listener of session.frameListeners) {
+      try {
+        listener(session.lastFrame);
+      } catch {}
+    }
+
+    return session.lastFrame;
   };
 
   const markFrameStale = (session) => {
@@ -127,11 +143,36 @@ function createBrowserService({
     session.navigationPhase = null;
   };
 
+  const syncViewport = async (session, viewport) => {
+    if (
+      session.viewportWidth === viewport.width
+      && session.viewportHeight === viewport.height
+    ) {
+      return;
+    }
+
+    session.viewportWidth = viewport.width;
+    session.viewportHeight = viewport.height;
+    markFrameStale(session);
+    publishState(session);
+    await session.remote.handleInput({
+      type: 'resize',
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height
+    });
+  };
+
   const handleFrame = (session, frame) => {
     touch(session);
     session.frameVersion += 1;
     session.frameMimeType = frame.mimeType || DEFAULT_FRAME_MIME_TYPE;
     session.hasFreshFrame = true;
+    session.lastFrame = {
+      frameVersion: session.frameVersion,
+      frameMimeType: session.frameMimeType,
+      buffer: frame.buffer
+    };
+    publishFrame(session);
     publishState(session);
   };
 
@@ -199,6 +240,8 @@ function createBrowserService({
       frameMimeType: DEFAULT_FRAME_MIME_TYPE,
       hasFreshFrame: false,
       listeners: new Set(),
+      frameListeners: new Set(),
+      lastFrame: null,
       remote: null
     };
 
@@ -237,29 +280,34 @@ function createBrowserService({
 
     if (existing) {
       touch(existing);
-      if (
-        existing.viewportWidth !== normalizedViewport.width
-        || existing.viewportHeight !== normalizedViewport.height
-      ) {
-        existing.viewportWidth = normalizedViewport.width;
-        existing.viewportHeight = normalizedViewport.height;
-        markFrameStale(existing);
-        publishState(existing);
-        await existing.remote.handleInput({
-          type: 'resize',
-          viewportWidth: normalizedViewport.width,
-          viewportHeight: normalizedViewport.height
-        });
-      }
+      await syncViewport(existing, normalizedViewport);
       return cloneState(existing);
     }
 
-    const session = await createManagedSession({
+    const pendingSession = pendingSessionPromisesByKey.get(key);
+    if (pendingSession) {
+      const session = await pendingSession;
+      touch(session);
+      await syncViewport(session, normalizedViewport);
+      return cloneState(session);
+    }
+
+    const sessionPromise = createManagedSession({
       userKey,
       sessionScope,
       viewportWidth: normalizedViewport.width,
       viewportHeight: normalizedViewport.height
     });
+    pendingSessionPromisesByKey.set(key, sessionPromise);
+
+    let session;
+    try {
+      session = await sessionPromise;
+    } finally {
+      if (pendingSessionPromisesByKey.get(key) === sessionPromise) {
+        pendingSessionPromisesByKey.delete(key);
+      }
+    }
 
     return cloneState(session);
   };
@@ -273,7 +321,7 @@ function createBrowserService({
   const getFrame = async (sessionId) => {
     const session = getSession(sessionId);
     touch(session);
-    return session.remote.getFrame();
+    return session.lastFrame || session.remote.getFrame();
   };
 
   const navigate = async (sessionId, url) => {
@@ -428,6 +476,18 @@ function createBrowserService({
     };
   };
 
+  const subscribeFrames = (sessionId, listener) => {
+    const session = getSession(sessionId);
+    touch(session);
+    session.frameListeners.add(listener);
+    return {
+      frame: session.lastFrame,
+      unsubscribe: () => {
+        session.frameListeners.delete(listener);
+      }
+    };
+  };
+
   const destroySession = async (sessionId) => {
     const session = sessionsById.get(sessionId);
     if (!session) return;
@@ -435,6 +495,7 @@ function createBrowserService({
     sessionsById.delete(sessionId);
     sessionIdByKey.delete(session.key);
     session.listeners.clear();
+    session.frameListeners.clear();
     await session.remote.dispose();
   };
 
@@ -486,6 +547,7 @@ function createBrowserService({
     stop,
     handleInput,
     subscribeState,
+    subscribeFrames,
     destroySession,
     disposeIdleSessions,
     dispose

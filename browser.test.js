@@ -1,78 +1,20 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
+const WebSocket = require('ws');
 const {
   createBrowserService,
   BROWSER_HOME_URL,
   MAX_VIEWPORT_AREA,
   normalizeViewportSize
 } = require('./browserService');
+const { createPlaywrightBrowserEngine } = require('./playwrightBrowserEngine');
 const { createApp } = require('./app');
-
-function openSseStream(url) {
-  return new Promise((resolve, reject) => {
-    const request = http.request(url, {
-      headers: {
-        Accept: 'text/event-stream'
-      }
-    });
-
-    request.on('response', (response) => {
-      response.setEncoding('utf8');
-
-      let buffer = '';
-      const waiters = [];
-
-      const flushWaiters = () => {
-        for (let index = waiters.length - 1; index >= 0; index -= 1) {
-          const waiter = waiters[index];
-          const matched = typeof waiter.pattern === 'string'
-            ? buffer.includes(waiter.pattern)
-            : waiter.pattern.test(buffer);
-
-          if (matched) {
-            waiters.splice(index, 1);
-            waiter.resolve(buffer);
-          }
-        }
-      };
-
-      response.on('data', (chunk) => {
-        buffer += chunk;
-        flushWaiters();
-      });
-
-      response.on('error', reject);
-
-      resolve({
-        response,
-        waitFor(pattern) {
-          const matched = typeof pattern === 'string'
-            ? buffer.includes(pattern)
-            : pattern.test(buffer);
-
-          if (matched) {
-            return Promise.resolve(buffer);
-          }
-
-          return new Promise((waitResolve) => {
-            waiters.push({
-              pattern,
-              resolve: waitResolve
-            });
-          });
-        },
-        close() {
-          response.destroy();
-          request.destroy();
-        }
-      });
-    });
-
-    request.on('error', reject);
-    request.end();
-  });
-}
+const { attachBrowserSocket } = require('./browserSocket');
+const {
+  CLIENT_BINARY_OPCODE,
+  FRAME_MIME_CODE,
+  SERVER_BINARY_OPCODE
+} = require('./browserProtocol');
 
 function createFakeFrame(label) {
   return {
@@ -183,7 +125,7 @@ function createFakeEngine() {
             await emitFrame('resize');
             return;
           }
-          if (payload.type === 'click' || payload.type === 'dblclick' || payload.type === 'wheel' || payload.type === 'keydown' || payload.type === 'type') {
+          if (payload.type === 'click' || payload.type === 'dblclick' || payload.type === 'wheel' || payload.type === 'keydown' || payload.type === 'type' || payload.type === 'paste') {
             await emitFrame(payload.type);
           }
         },
@@ -223,6 +165,200 @@ function createFakeEngine() {
   };
 }
 
+function createClickPacket(x, y, buttonCode) {
+  const buffer = Buffer.alloc(8);
+  buffer.writeUInt8(CLIENT_BINARY_OPCODE.CLICK, 0);
+  buffer.writeUInt16LE(5, 1);
+  buffer.writeUInt16LE(x, 3);
+  buffer.writeUInt16LE(y, 5);
+  buffer.writeUInt8(buttonCode, 7);
+  return buffer;
+}
+
+function createInvalidPacket() {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt8(0xff, 0);
+  buffer.writeUInt16LE(1, 1);
+  buffer.writeUInt8(0, 3);
+  return buffer;
+}
+
+function parseFramePacket(buffer) {
+  return {
+    opcode: buffer.readUInt8(0),
+    frameVersion: buffer.readUInt32LE(1),
+    mimeCode: buffer.readUInt8(5),
+    payload: buffer.subarray(6).toString()
+  };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createFakePlaywrightModule() {
+  const page = {
+    handlers: new Map(),
+    bindings: new Map(),
+    currentUrl: 'about:blank',
+    currentTitle: '',
+    viewport: null,
+    screenshotCount: 0,
+    mainFrameRef: {
+      url() {
+        return page.currentUrl;
+      }
+    },
+    on(eventName, handler) {
+      const handlers = this.handlers.get(eventName) || [];
+      handlers.push(handler);
+      this.handlers.set(eventName, handlers);
+    },
+    async emit(eventName, ...args) {
+      for (const handler of this.handlers.get(eventName) || []) {
+        await handler(...args);
+      }
+    },
+    async exposeBinding(name, handler) {
+      this.bindings.set(name, handler);
+    },
+    async addInitScript() {},
+    mainFrame() {
+      return this.mainFrameRef;
+    },
+    url() {
+      return this.currentUrl;
+    },
+    async title() {
+      return this.currentTitle;
+    },
+    async screenshot() {
+      this.screenshotCount += 1;
+      return Buffer.from(`shot:${this.screenshotCount}`);
+    },
+    async goto(url) {
+      this.currentUrl = url;
+      this.currentTitle = url.includes('#yoctol-home=') ? 'Yoctol Startpagina' : url;
+      await this.emit('framenavigated', this.mainFrameRef);
+      await this.emit('domcontentloaded');
+      await this.emit('load');
+      return { url };
+    },
+    async goBack() {
+      return null;
+    },
+    async goForward() {
+      return null;
+    },
+    async reload() {
+      await this.emit('domcontentloaded');
+      await this.emit('load');
+      return { url: this.currentUrl };
+    },
+    async evaluate() {},
+    async setViewportSize(viewport) {
+      this.viewport = viewport;
+    },
+    mouse: {
+      async move() {},
+      async click() {},
+      async wheel() {}
+    },
+    keyboard: {
+      async press() {},
+      async up() {},
+      async insertText() {}
+    },
+    async bringToFront() {}
+  };
+
+  const context = {
+    page,
+    async newPage() {
+      return page;
+    },
+    async close() {}
+  };
+
+  const browser = {
+    async newContext(options) {
+      page.viewport = options.viewport;
+      return context;
+    },
+    on() {},
+    isConnected() {
+      return true;
+    },
+    async close() {}
+  };
+
+  return {
+    page,
+    chromium: {
+      async launch() {
+        return browser;
+      }
+    }
+  };
+}
+
+function openBrowserSocket(url) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const messages = [];
+    const waiters = [];
+
+    const flushWaiters = (message) => {
+      for (let index = waiters.length - 1; index >= 0; index -= 1) {
+        const waiter = waiters[index];
+        try {
+          if (waiter.matcher(message)) {
+            waiters.splice(index, 1);
+            waiter.resolve(message);
+          }
+        } catch (error) {
+          waiters.splice(index, 1);
+          waiter.reject(error);
+        }
+      }
+    };
+
+    socket.on('open', () => {
+      resolve({
+        socket,
+        messages,
+        waitFor(matcher) {
+          const existing = messages.find(matcher);
+          if (existing) {
+            return Promise.resolve(existing);
+          }
+
+          return new Promise((waitResolve, waitReject) => {
+            waiters.push({
+              matcher,
+              resolve: waitResolve,
+              reject: waitReject
+            });
+          });
+        },
+        close() {
+          socket.close();
+        }
+      });
+    });
+
+    socket.on('message', (data) => {
+      const message = (typeof data === 'string')
+        ? { kind: 'text', data: JSON.parse(data) }
+        : { kind: 'binary', data: Buffer.from(data) };
+      messages.push(message);
+      flushWaiters(message);
+    });
+
+    socket.on('error', reject);
+  });
+}
+
 test('normalizeViewportSize caps area while preserving orientation', () => {
   const viewport = normalizeViewportSize(1920, 1080);
   assert.ok((viewport.width * viewport.height) <= MAX_VIEWPORT_AREA);
@@ -259,6 +395,52 @@ test('browser service reuses sessions per user and isolates users from each othe
     type: 'resize',
     viewportWidth: aliceTwo.viewportWidth,
     viewportHeight: aliceTwo.viewportHeight
+  });
+
+  await service.dispose();
+});
+
+test('browser service deduplicates concurrent session boot for the same key', async () => {
+  const engine = createFakeEngine();
+  const originalCreateSession = engine.createSession.bind(engine);
+  let releaseCreateSession;
+  const createSessionGate = new Promise((resolve) => {
+    releaseCreateSession = resolve;
+  });
+
+  engine.createSession = async (options) => {
+    await createSessionGate;
+    return originalCreateSession(options);
+  };
+
+  const service = createBrowserService({ engine, autoCleanup: false });
+
+  const firstSessionPromise = service.ensureSession({
+    userKey: 'alice',
+    sessionScope: 'browser',
+    viewportWidth: 800,
+    viewportHeight: 600
+  });
+  const secondSessionPromise = service.ensureSession({
+    userKey: 'alice',
+    sessionScope: 'browser',
+    viewportWidth: 1024,
+    viewportHeight: 768
+  });
+
+  releaseCreateSession();
+
+  const [firstSession, secondSession] = await Promise.all([
+    firstSessionPromise,
+    secondSessionPromise
+  ]);
+
+  assert.equal(firstSession.sessionId, secondSession.sessionId);
+  assert.equal(engine.remotes.length, 1);
+  assert.deepEqual(engine.remotes[0].inputs[0], {
+    type: 'resize',
+    viewportWidth: secondSession.viewportWidth,
+    viewportHeight: secondSession.viewportHeight
   });
 
   await service.dispose();
@@ -335,6 +517,13 @@ test('focus and move do not stale the frame, while dirty inputs refresh it', asy
   assert.equal(state.frameVersion, 2);
   assert.equal(state.hasFreshFrame, true);
 
+  state = await service.handleInput(session.sessionId, {
+    type: 'paste',
+    text: 'hunter2'
+  });
+  assert.equal(state.frameVersion, 3);
+  assert.equal(state.hasFreshFrame, true);
+
   await service.dispose();
 });
 
@@ -365,118 +554,240 @@ test('browser service cleans up idle sessions', async () => {
   await service.dispose();
 });
 
-test('browser app exposes cached JPEG frames over HTTP', async () => {
+test('playwright browser engine rerenders when the page changes without input', async () => {
+  const fakePlaywright = createFakePlaywrightModule();
+  const frames = [];
+  const engine = createPlaywrightBrowserEngine({
+    requirePlaywright: () => fakePlaywright,
+    interactiveRenderDelayMs: 5,
+    idleRenderDelayMs: 10,
+    observedChangeRenderDelayMs: 5
+  });
+
+  const session = await engine.createSession({
+    sessionId: 'session-1',
+    viewportWidth: 800,
+    viewportHeight: 600,
+    onNavigation() {},
+    onLoadingChange() {},
+    onError(error) {
+      throw error;
+    },
+    onFrame(frame) {
+      frames.push(frame.buffer.toString());
+    }
+  });
+
+  await session.navigateHome();
+  await wait(30);
+  const baselineFrameCount = frames.length;
+
+  const pageChangeBinding = fakePlaywright.page.bindings.get('__chatlonPageChanged');
+  assert.equal(typeof pageChangeBinding, 'function');
+
+  await pageChangeBinding({
+    page: fakePlaywright.page,
+    frame: fakePlaywright.page.mainFrame()
+  });
+  await wait(30);
+
+  assert.ok(frames.length > baselineFrameCount);
+
+  await session.dispose();
+  await engine.dispose();
+});
+
+test('browser socket streams session state and binary JPEG frames', async () => {
   const engine = createFakeEngine();
   const browserService = createBrowserService({ engine, autoCleanup: false });
   const { app } = createApp({ browserService, includeGun: false });
   const server = await new Promise((resolve) => {
     const instance = app.listen(0, () => resolve(instance));
   });
+  const browserSocket = attachBrowserSocket(server, { browserService });
   const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = `ws://127.0.0.1:${address.port}/browser/socket`;
+
+  let client = null;
 
   try {
-    let response = await fetch(`${baseUrl}/browser/session`, {
-      method: 'OPTIONS',
-      headers: {
-        Origin: 'https://chatlon-client.example',
-        'Access-Control-Request-Method': 'POST',
-        'Access-Control-Request-Headers': 'Content-Type'
-      }
-    });
-    assert.equal(response.status, 204);
-    assert.equal(response.headers.get('access-control-allow-origin'), 'https://chatlon-client.example');
-    assert.match(response.headers.get('access-control-allow-methods'), /POST/);
-
-    response = await fetch(`${baseUrl}/browser/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    client = await openBrowserSocket(baseUrl);
+    client.socket.send(JSON.stringify({
+      type: 'session.ensure',
+      payload: {
         userKey: 'alice',
         sessionScope: 'browser',
         viewportWidth: 800,
         viewportHeight: 600
-      })
-    });
-    assert.equal(response.status, 200);
-    const created = await response.json();
-    assert.ok(created.sessionId);
-    assert.equal(created.url, BROWSER_HOME_URL);
-    assert.equal(created.frameVersion, 1);
-    assert.equal(created.frameMimeType, 'image/jpeg');
-    assert.equal(created.hasFreshFrame, true);
+      }
+    }));
 
-    response = await fetch(`${baseUrl}/browser/frame/${created.sessionId}`);
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-type'), 'image/jpeg');
-    const frame = Buffer.from(await response.arrayBuffer());
-    assert.match(frame.toString(), /^frame:/);
+    const readyMessage = await client.waitFor((message) => (
+      message.kind === 'text' && message.data.type === 'session.ready'
+    ));
+    assert.equal(readyMessage.data.payload.state.url, BROWSER_HOME_URL);
+    assert.equal(readyMessage.data.payload.state.frameVersion, 1);
 
-    response = await fetch(`${baseUrl}/browser/frame/${created.sessionId}`);
-    assert.equal(response.status, 200);
-    const repeatedFrame = Buffer.from(await response.arrayBuffer());
-    assert.equal(repeatedFrame.toString(), frame.toString());
-
-    response = await fetch(`${baseUrl}/browser/state/${created.sessionId}`);
-    assert.equal(response.status, 200);
-    const state = await response.json();
-    assert.equal(state.frameVersion, 1);
-
-    response = await fetch(`${baseUrl}/browser/state/missing-session`);
-    assert.equal(response.status, 404);
-    const missing = await response.json();
-    assert.match(missing.error, /Browsersessie niet gevonden/);
+    const frameMessage = await client.waitFor((message) => message.kind === 'binary');
+    const frame = parseFramePacket(frameMessage.data);
+    assert.equal(frame.opcode, SERVER_BINARY_OPCODE.FRAME);
+    assert.equal(frame.frameVersion, 1);
+    assert.equal(frame.mimeCode, FRAME_MIME_CODE.JPEG);
+    assert.match(frame.payload, /^frame:/);
   } finally {
+    client?.close();
+    await browserSocket.close();
     await new Promise((resolve) => server.close(resolve));
     await browserService.dispose();
   }
 });
 
-test('browser app exposes live browser state over SSE', async () => {
+test('browser socket handles commands and binary pointer input', async () => {
   const engine = createFakeEngine();
   const browserService = createBrowserService({ engine, autoCleanup: false });
   const { app } = createApp({ browserService, includeGun: false });
   const server = await new Promise((resolve) => {
     const instance = app.listen(0, () => resolve(instance));
   });
+  const browserSocket = attachBrowserSocket(server, { browserService });
   const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = `ws://127.0.0.1:${address.port}/browser/socket`;
 
-  let stream = null;
+  let client = null;
 
   try {
-    const createResponse = await fetch(`${baseUrl}/browser/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    client = await openBrowserSocket(baseUrl);
+    client.socket.send(JSON.stringify({
+      type: 'session.ensure',
+      payload: {
         userKey: 'alice',
         sessionScope: 'browser',
         viewportWidth: 800,
         viewportHeight: 600
-      })
-    });
-    const created = await createResponse.json();
+      }
+    }));
 
-    stream = await openSseStream(`${baseUrl}/browser/events/${created.sessionId}`);
-    assert.equal(stream.response.statusCode, 200);
-    assert.match(stream.response.headers['content-type'], /text\/event-stream/);
+    await client.waitFor((message) => (
+      message.kind === 'text' && message.data.type === 'session.ready'
+    ));
 
-    await stream.waitFor(BROWSER_HOME_URL);
-
-    const navigateResponse = await fetch(`${baseUrl}/browser/navigate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: created.sessionId,
+    client.socket.send(JSON.stringify({
+      type: 'browser.command',
+      payload: {
+        action: 'navigate',
         url: 'https://example.com/'
-      })
-    });
-    assert.equal(navigateResponse.status, 200);
+      }
+    }));
 
-    const payload = await stream.waitFor('https://example.com/');
-    assert.match(payload, /"url":"https:\/\/example.com\/"/);
+    const navigateState = await client.waitFor((message) => (
+      message.kind === 'text'
+      && message.data.type === 'browser.state'
+      && message.data.payload.url === 'https://example.com/'
+    ));
+    assert.equal(navigateState.data.payload.canGoBack, true);
+
+    client.socket.send(createClickPacket(24, 32, 0));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.deepEqual(engine.remotes[0].inputs.at(-1), {
+      type: 'click',
+      x: 24,
+      y: 32,
+      button: 'left'
+    });
   } finally {
-    stream?.close();
+    client?.close();
+    await browserSocket.close();
+    await new Promise((resolve) => server.close(resolve));
+    await browserService.dispose();
+  }
+});
+
+test('browser socket reports invalid binary packets without dropping the session', async () => {
+  const engine = createFakeEngine();
+  const browserService = createBrowserService({ engine, autoCleanup: false });
+  const { app } = createApp({ browserService, includeGun: false });
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, () => resolve(instance));
+  });
+  const browserSocket = attachBrowserSocket(server, { browserService });
+  const address = server.address();
+  const baseUrl = `ws://127.0.0.1:${address.port}/browser/socket`;
+
+  let client = null;
+
+  try {
+    client = await openBrowserSocket(baseUrl);
+    client.socket.send(JSON.stringify({
+      type: 'session.ensure',
+      payload: {
+        userKey: 'alice',
+        sessionScope: 'browser',
+        viewportWidth: 800,
+        viewportHeight: 600
+      }
+    }));
+
+    const readyMessage = await client.waitFor((message) => (
+      message.kind === 'text' && message.data.type === 'session.ready'
+    ));
+    const sessionId = readyMessage.data.payload.state.sessionId;
+
+    client.socket.send(createInvalidPacket());
+
+    const errorMessage = await client.waitFor((message) => (
+      message.kind === 'text' && message.data.type === 'browser.error'
+    ));
+    assert.match(errorMessage.data.payload.message, /Unknown browser input opcode/);
+
+    const state = await browserService.getState(sessionId);
+    assert.equal(state.url, BROWSER_HOME_URL);
+  } finally {
+    client?.close();
+    await browserSocket.close();
+    await new Promise((resolve) => server.close(resolve));
+    await browserService.dispose();
+  }
+});
+
+test('closing a browser socket only removes listeners and keeps the session alive', async () => {
+  const engine = createFakeEngine();
+  const browserService = createBrowserService({ engine, autoCleanup: false });
+  const { app } = createApp({ browserService, includeGun: false });
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, () => resolve(instance));
+  });
+  const browserSocket = attachBrowserSocket(server, { browserService });
+  const address = server.address();
+  const baseUrl = `ws://127.0.0.1:${address.port}/browser/socket`;
+
+  let client = null;
+
+  try {
+    client = await openBrowserSocket(baseUrl);
+    client.socket.send(JSON.stringify({
+      type: 'session.ensure',
+      payload: {
+        userKey: 'alice',
+        sessionScope: 'browser',
+        viewportWidth: 800,
+        viewportHeight: 600
+      }
+    }));
+
+    const readyMessage = await client.waitFor((message) => (
+      message.kind === 'text' && message.data.type === 'session.ready'
+    ));
+    const sessionId = readyMessage.data.payload.state.sessionId;
+
+    client.close();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const state = await browserService.getState(sessionId);
+    assert.equal(state.sessionId, sessionId);
+    assert.equal(engine.remotes[0].disposed, false);
+  } finally {
+    await browserSocket.close();
     await new Promise((resolve) => server.close(resolve));
     await browserService.dispose();
   }

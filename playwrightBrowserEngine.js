@@ -2,9 +2,11 @@ const { BROWSER_HOME_URL } = require('./browserService');
 
 const INTERACTIVE_RENDER_DELAY_MS = 35;
 const IDLE_RENDER_DELAY_MS = 180;
+const OBSERVED_CHANGE_RENDER_DELAY_MS = 120;
 const INTERACTIVE_JPEG_QUALITY = 46;
 const IDLE_JPEG_QUALITY = 78;
 const FRAME_MIME_TYPE = 'image/jpeg';
+const PAGE_CHANGE_BINDING = '__chatlonPageChanged';
 
 function createMissingPlaywrightError(error) {
   const message = error?.message || 'Playwright is niet beschikbaar.';
@@ -37,21 +39,54 @@ function normalizeTitle(page, mode) {
 
 function createPlaywrightBrowserEngine({
   requirePlaywright = () => require('playwright'),
-  launchOptions = { headless: true }
+  launchOptions = { headless: true },
+  interactiveRenderDelayMs = INTERACTIVE_RENDER_DELAY_MS,
+  idleRenderDelayMs = IDLE_RENDER_DELAY_MS,
+  observedChangeRenderDelayMs = OBSERVED_CHANGE_RENDER_DELAY_MS
 } = {}) {
   let browserPromise = null;
+  let browserInstance = null;
+
+  const launchBrowser = async () => {
+    try {
+      const playwright = requirePlaywright();
+      const chromium = playwright.chromium || playwright;
+      const browser = await chromium.launch(launchOptions);
+
+      browserInstance = browser;
+      browser.on('disconnected', () => {
+        if (browserInstance === browser) {
+          browserInstance = null;
+          browserPromise = null;
+        }
+      });
+
+      return browser;
+    } catch (error) {
+      browserPromise = null;
+      browserInstance = null;
+      throw createMissingPlaywrightError(error);
+    }
+  };
 
   const getBrowser = async () => {
-    if (!browserPromise) {
-      browserPromise = (async () => {
-        try {
-          const playwright = requirePlaywright();
-          const chromium = playwright.chromium || playwright;
-          return chromium.launch(launchOptions);
-        } catch (error) {
-          throw createMissingPlaywrightError(error);
+    if (browserPromise) {
+      try {
+        const browser = await browserPromise;
+        if (typeof browser.isConnected === 'function' && !browser.isConnected()) {
+          browserPromise = null;
+          browserInstance = null;
+        } else {
+          return browser;
         }
-      })();
+      } catch {
+        browserPromise = null;
+        browserInstance = null;
+      }
+    }
+
+    if (!browserPromise) {
+      browserPromise = launchBrowser();
     }
 
     return browserPromise;
@@ -78,6 +113,7 @@ function createPlaywrightBrowserEngine({
     let homeVisitId = 0;
     let interactiveRenderTimer = null;
     let idleRenderTimer = null;
+    let observedRenderTimer = null;
     let cachedFrame = null;
     let renderInFlight = null;
     let pendingRenderQuality = null;
@@ -104,6 +140,10 @@ function createPlaywrightBrowserEngine({
       if (idleRenderTimer) {
         clearTimeout(idleRenderTimer);
         idleRenderTimer = null;
+      }
+      if (observedRenderTimer) {
+        clearTimeout(observedRenderTimer);
+        observedRenderTimer = null;
       }
     };
 
@@ -162,7 +202,7 @@ function createPlaywrightBrowserEngine({
       interactiveRenderTimer = setTimeout(() => {
         interactiveRenderTimer = null;
         queueRender(INTERACTIVE_JPEG_QUALITY);
-      }, INTERACTIVE_RENDER_DELAY_MS);
+      }, interactiveRenderDelayMs);
     };
 
     const scheduleIdleRender = () => {
@@ -173,8 +213,92 @@ function createPlaywrightBrowserEngine({
       idleRenderTimer = setTimeout(() => {
         idleRenderTimer = null;
         queueRender(IDLE_JPEG_QUALITY);
-      }, IDLE_RENDER_DELAY_MS);
+      }, idleRenderDelayMs);
     };
+
+    const scheduleObservedRender = () => {
+      if (disposed || observedRenderTimer) return;
+
+      observedRenderTimer = setTimeout(() => {
+        observedRenderTimer = null;
+        queueRender(INTERACTIVE_JPEG_QUALITY);
+        scheduleIdleRender();
+      }, observedChangeRenderDelayMs);
+    };
+
+    await page.exposeBinding(PAGE_CHANGE_BINDING, ({ page: sourcePage, frame }) => {
+      if (disposed || sourcePage !== page || frame !== page.mainFrame()) {
+        return;
+      }
+
+      scheduleObservedRender();
+    });
+
+    await page.addInitScript((bindingName) => {
+      const install = () => {
+        if (window.__chatlonPageObserverInstalled) {
+          return;
+        }
+        window.__chatlonPageObserverInstalled = true;
+
+        let notifyQueued = false;
+        const notifyChange = () => {
+          if (notifyQueued) {
+            return;
+          }
+
+          notifyQueued = true;
+          setTimeout(() => {
+            notifyQueued = false;
+            const notify = window[bindingName];
+            if (typeof notify === 'function') {
+              Promise.resolve(notify()).catch(() => {});
+            }
+          }, 0);
+        };
+
+        const root = document.documentElement || document.body;
+        if (root) {
+          const observer = new MutationObserver(() => {
+            notifyChange();
+          });
+
+          observer.observe(root, {
+            subtree: true,
+            childList: true,
+            characterData: true,
+            attributes: true
+          });
+        }
+
+        const wrapHistoryMethod = (methodName) => {
+          const original = history[methodName];
+          if (typeof original !== 'function') {
+            return;
+          }
+
+          history[methodName] = function wrappedHistoryMethod(...args) {
+            const result = original.apply(this, args);
+            notifyChange();
+            return result;
+          };
+        };
+
+        wrapHistoryMethod('pushState');
+        wrapHistoryMethod('replaceState');
+
+        window.addEventListener('hashchange', notifyChange, { passive: true });
+        window.addEventListener('popstate', notifyChange, { passive: true });
+        document.addEventListener('readystatechange', notifyChange, { passive: true });
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', install, { once: true });
+        return;
+      }
+
+      install();
+    }, PAGE_CHANGE_BINDING);
 
     page.on('framenavigated', async (frame) => {
       if (frame !== page.mainFrame()) return;
@@ -212,35 +336,50 @@ function createPlaywrightBrowserEngine({
 
     const navigateHome = async () => {
       onLoadingChange?.(true);
-      await page.goto(encodeHomeDocument(sessionId, ++homeVisitId), {
-        waitUntil: 'domcontentloaded'
-      });
-      scheduleInteractiveRender();
-      scheduleIdleRender();
+      try {
+        await page.goto(encodeHomeDocument(sessionId, ++homeVisitId), {
+          waitUntil: 'domcontentloaded'
+        });
+        scheduleInteractiveRender();
+        scheduleIdleRender();
+      } catch (error) {
+        onLoadingChange?.(false);
+        throw error;
+      }
     };
 
     const navigate = async (url) => {
       onLoadingChange?.(true);
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded'
-      });
-      scheduleInteractiveRender();
-      scheduleIdleRender();
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded'
+        });
+        scheduleInteractiveRender();
+        scheduleIdleRender();
+      } catch (error) {
+        onLoadingChange?.(false);
+        throw error;
+      }
     };
 
     const stepHistory = async (direction) => {
       onLoadingChange?.(true);
-      const result = direction === 'back'
-        ? await page.goBack({ waitUntil: 'domcontentloaded' })
-        : await page.goForward({ waitUntil: 'domcontentloaded' });
+      try {
+        const result = direction === 'back'
+          ? await page.goBack({ waitUntil: 'domcontentloaded' })
+          : await page.goForward({ waitUntil: 'domcontentloaded' });
 
-      if (!result) {
+        if (!result) {
+          onLoadingChange?.(false);
+          await emitNavigation();
+        }
+
+        scheduleInteractiveRender();
+        scheduleIdleRender();
+      } catch (error) {
         onLoadingChange?.(false);
-        await emitNavigation();
+        throw error;
       }
-
-      scheduleInteractiveRender();
-      scheduleIdleRender();
     };
 
     return {
@@ -250,9 +389,14 @@ function createPlaywrightBrowserEngine({
       goForward: async () => stepHistory('forward'),
       reload: async () => {
         onLoadingChange?.(true);
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        scheduleInteractiveRender();
-        scheduleIdleRender();
+        try {
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          scheduleInteractiveRender();
+          scheduleIdleRender();
+        } catch (error) {
+          onLoadingChange?.(false);
+          throw error;
+        }
       },
       stop: async () => {
         await page.evaluate(() => window.stop()).catch(() => {});
@@ -308,6 +452,11 @@ function createPlaywrightBrowserEngine({
             scheduleInteractiveRender();
             scheduleIdleRender();
             return;
+          case 'paste':
+            await page.keyboard.insertText(payload.text || '');
+            scheduleInteractiveRender();
+            scheduleIdleRender();
+            return;
           case 'focus':
             await page.bringToFront().catch(() => {});
             return;
@@ -316,8 +465,8 @@ function createPlaywrightBrowserEngine({
         }
       },
       ensureFrame: async () => {
-        clearRenderTimers();
         if (!cachedFrame && !renderInFlight) {
+          clearRenderTimers();
           return renderFrame(IDLE_JPEG_QUALITY);
         }
         if (renderInFlight) {
@@ -341,6 +490,7 @@ function createPlaywrightBrowserEngine({
       if (!browserPromise) return;
       const browser = await browserPromise.catch(() => null);
       browserPromise = null;
+      browserInstance = null;
       if (browser) {
         await browser.close();
       }
